@@ -1,4 +1,4 @@
-module control #(
+module control (
     input  logic [5:0] op,
     output logic regDst, aluSrc, memToReg, regWrite, memRead, memWrite, branch, aluOP1, aluOP0
 );
