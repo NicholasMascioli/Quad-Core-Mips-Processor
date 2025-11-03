@@ -1,4 +1,4 @@
-module alu_control #(
+module alu_control (
     input  logic [1:0] aluOP,
     input  logic [5:0] funct,
     output logic [2:0] op
@@ -23,5 +23,6 @@ module alu_control #(
             end
         end
     end
+
 
 endmodule
