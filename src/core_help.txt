@@ -1,0 +1,386 @@
+// ============================================================================
+// 5-Stage Pipelined MIPS Core (IF/ID/EX/MEM/WB)
+// Simple I/D memory interfaces; branch handling; hazard + forwarding
+// Fits your diagram (PC+4 adder, sign-extend, shift-left-2, branch adder, etc.)
+// ============================================================================
+
+module core #(
+  parameter int XLEN       = 32,
+  parameter int REG_ADDR_W = 5,
+  parameter int RESET_PC   = 'h0000_0000
+)(
+  input  logic                 clk,
+  input  logic                 rst_n,
+
+  // ---------------- Instruction memory (simple Harvard I-port) ---------------
+  output logic [XLEN-1:0]      imem_addr,   // PC
+  input  logic [XLEN-1:0]      imem_rdata,  // fetched instruction
+
+  // ---------------- Data memory (simple Harvard D-port) ----------------------
+  output logic                 dmem_memRead,
+  output logic                 dmem_memWrite,
+  output logic [3:0]           dmem_be,     // byte-enables (word ops -> 4'b1111)
+  output logic [XLEN-1:0]      dmem_addr,
+  output logic [XLEN-1:0]      dmem_wdata,
+  input  logic [XLEN-1:0]      dmem_rdata
+);
+
+  // ===========================================================================
+  // IF stage: PC and PC+4
+  // ===========================================================================
+  logic [XLEN-1:0] pc_q, pc_n;
+  logic            pcWrite;     // from hazard
+  logic            pc_en;
+
+  // PC register (active-low reset)
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) pc_q <= RESET_PC;
+    else if (pc_en) pc_q <= pc_n;
+  end
+
+  // Feed instruction memory
+  assign imem_addr = pc_q;
+
+  // Adder: PC + 4
+  logic [XLEN-1:0] pc_plus4 = pc_q + 32'd4;
+
+  // IF/ID pipeline register ---------------------------------------------------
+  typedef struct packed {
+    logic [XLEN-1:0] pc_plus4;
+    logic [XLEN-1:0] instr;
+    logic            valid;
+  } ifid_t;
+
+  ifid_t ifid_q, ifid_d;
+  logic  ifIdW;  // from hazard
+
+  always_comb begin
+    ifid_d = ifid_q;
+    if (ifIdW) begin
+      ifid_d.pc_plus4 = pc_plus4;
+      ifid_d.instr    = imem_rdata;
+      ifid_d.valid    = 1'b1;
+    end
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) ifid_q <= '0;
+    else        ifid_q <= ifid_d;
+  end
+
+  // ===========================================================================
+  // ID stage: decode, regfile, sign-extend
+  // ===========================================================================
+  logic [5:0]             op    = ifid_q.instr[31:26];
+  logic [REG_ADDR_W-1:0]  rs    = ifid_q.instr[25:21];
+  logic [REG_ADDR_W-1:0]  rt    = ifid_q.instr[20:16];
+  logic [REG_ADDR_W-1:0]  rd    = ifid_q.instr[15:11];
+  logic [15:0]            imm16 = ifid_q.instr[15:0];
+  logic [5:0]             funct = ifid_q.instr[5:0];
+
+  // Sign-extend
+  logic [XLEN-1:0] imm_sext = {{16{imm16[15]}}, imm16};
+
+  // Control signals (from control.sv)
+  logic regDst, aluSrc, memToReg, regWrite, memRead, memWrite, branch;
+  logic aluOP1, aluOP0;
+
+  // NOTE: Your control.sv currently declares ports incorrectly (as parameters).
+  // Fix header to `module control(input logic [5:0] op, output ... );`
+  control u_ctl (
+    .op       (op),
+    .regDst   (regDst),
+    .aluSrc   (aluSrc),
+    .memToReg (memToReg),
+    .regWrite (regWrite),
+    .memRead  (memRead),
+    .memWrite (memWrite),
+    .branch   (branch),
+    .aluOP1   (aluOP1),
+    .aluOP0   (aluOP0)
+  );
+
+  // Register file -------------------------------------------------------------
+  logic [XLEN-1:0] rs_data, rt_data;
+
+  // Your regfile.sv uses params N (width) and M (#regs). For MIPS use M=32.
+  regfile #(.N(XLEN), .M(32)) u_rf (
+    .clk    (clk),
+    .rst    (~rst_n),
+    .we     (/* driven in WB */),
+    .waddr  (/* driven in WB */),
+    .raddr1 (rs),
+    .raddr2 (rt),
+    .wdata  (/* driven in WB */),
+    .rdata1 (rs_data),
+    .rdata2 (rt_data)
+  );
+
+  // ID/EX pipeline register ---------------------------------------------------
+  typedef struct packed {
+    // values
+    logic [XLEN-1:0] pc_plus4;
+    logic [XLEN-1:0] rs_data, rt_data, imm_sext;
+    logic [REG_ADDR_W-1:0] rs, rt, rd;
+    logic [5:0] funct;
+
+    // controls (grouped as in diagram: WB/M/EX)
+    // EX
+    logic       regDst, aluSrc;
+    logic [1:0] aluOP;        // {aluOP1,aluOP0}
+    // M
+    logic       memRead, memWrite, branch;
+    // WB
+    logic       memToReg, regWrite;
+
+    logic       valid;
+  } idex_t;
+
+  idex_t idex_q, idex_d;
+  logic  controlMux;  // from hazard: 1=pass controls, 0=insert bubble
+
+  always_comb begin
+    idex_d = idex_q;
+
+    idex_d.pc_plus4 = ifid_q.pc_plus4;
+    idex_d.rs_data  = rs_data;
+    idex_d.rt_data  = rt_data;
+    idex_d.imm_sext = imm_sext;
+    idex_d.rs       = rs;
+    idex_d.rt       = rt;
+    idex_d.rd       = rd;
+    idex_d.funct    = funct;
+    idex_d.valid    = ifid_q.valid;
+
+    // pack ALUop from control
+    logic [1:0] aluOP = {aluOP1, aluOP0};
+
+    if (controlMux) begin
+      idex_d.regDst   = regDst;
+      idex_d.aluSrc   = aluSrc;
+      idex_d.aluOP    = aluOP;
+      idex_d.memRead  = memRead;
+      idex_d.memWrite = memWrite;
+      idex_d.branch   = branch;
+      idex_d.memToReg = memToReg;
+      idex_d.regWrite = regWrite;
+    end else begin
+      // bubble (zero EX/M/WB controls)
+      idex_d.regDst   = 1'b0;
+      idex_d.aluSrc   = 1'b0;
+      idex_d.aluOP    = 2'b00;
+      idex_d.memRead  = 1'b0;
+      idex_d.memWrite = 1'b0;
+      idex_d.branch   = 1'b0;
+      idex_d.memToReg = 1'b0;
+      idex_d.regWrite = 1'b0;
+    end
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) idex_q <= '0;
+    else        idex_q <= idex_d;
+  end
+
+  // ===========================================================================
+  // EX stage: forwarding muxes, ALU, branch target
+  // ===========================================================================
+  // Forwarding unit (your forward.sv ports)
+  logic [1:0] forwardA, forwardB;
+
+  // Values that can be forwarded:
+  logic [XLEN-1:0] exmem_aluResult;
+  logic [XLEN-1:0] memwb_wbData;
+
+  forward u_fwd (
+    .exMemRegW (/* from EX/MEM below */),
+    .exMemRegRd(/* from EX/MEM below */),
+    .memWbRegW (/* from MEM/WB below */),
+    .memWbRd   (/* from MEM/WB below */),
+    .idExRs    (idex_q.rs),
+    .idExRt    (idex_q.rt),
+    .forwardA  (forwardA),
+    .forwardB  (forwardB)
+  );
+
+  // Select forwarded operands
+  logic [XLEN-1:0] alu_srcA_raw, alu_srcB_raw;
+
+  always_comb begin
+    // default
+    alu_srcA_raw = idex_q.rs_data;
+    alu_srcB_raw = idex_q.rt_data;
+
+    unique case (forwardA)
+      2'b10: alu_srcA_raw = exmem_aluResult;
+      2'b01: alu_srcA_raw = memwb_wbData;
+      default: /* 00 */ ;
+    endcase
+
+    unique case (forwardB)
+      2'b10: alu_srcB_raw = exmem_aluResult;
+      2'b01: alu_srcB_raw = memwb_wbData;
+      default: /* 00 */ ;
+    endcase
+  end
+
+  // ALU control (bundle 2-bit aluOP for your alu_control.sv)
+  logic [2:0] alu_op_sel;
+  // NOTE: your alu_control.sv also declares ports incorrectly. Fix to:
+  // module alu_control(input logic [1:0] aluOP, input logic [5:0] funct, output logic [2:0] op);
+  alu_control u_aluctl (
+    .aluOP (idex_q.aluOP),
+    .funct (idex_q.funct),
+    .op    (alu_op_sel)
+  );
+
+  // ALUSrc mux (B input)
+  logic [XLEN-1:0] alu_srcB = (idex_q.aluSrc) ? idex_q.imm_sext : alu_srcB_raw;
+
+  // ALU
+  logic [XLEN-1:0] alu_result;
+  logic            alu_zero;
+
+  // NOTE: your n_alu.sv needs fixes; interface assumed as below.
+  n_alu #(.WIDTH(XLEN)) u_alu (
+    .op     (alu_op_sel),
+    .a      (alu_srcA_raw),
+    .b      (alu_srcB),
+    .result (alu_result),
+    .zero   (alu_zero)
+  );
+
+  // Destination register mux (RegDst)
+  logic [REG_ADDR_W-1:0] ex_dest = (idex_q.regDst) ? idex_q.rd : idex_q.rt;
+
+  // Branch target: shift-left-2 + add to PC+4
+  logic [XLEN-1:0] imm_sl2 = {idex_q.imm_sext[XLEN-1:2], 2'b00};
+  logic [XLEN-1:0] branch_target = idex_q.pc_plus4 + imm_sl2;
+
+  // Branch decision (BEQ): PCSrc = Branch & Zero
+  logic pcsrctaken = idex_q.branch & alu_zero;
+
+  // EX/MEM pipeline register ---------------------------------------------------
+  typedef struct packed {
+    // pass-through values
+    logic [XLEN-1:0] alu_result;
+    logic [XLEN-1:0] rt_forwarded;  // store data (pre-ALUSrc), after forwarding
+    logic [REG_ADDR_W-1:0] rd;
+
+    // M
+    logic memRead, memWrite;
+    // WB
+    logic memToReg, regWrite;
+
+    logic valid;
+  } exmem_t;
+
+  exmem_t exmem_q, exmem_d;
+
+  always_comb begin
+    exmem_d = exmem_q;
+
+    exmem_d.alu_result   = alu_result;
+    exmem_d.rt_forwarded = alu_srcB_raw;
+    exmem_d.rd           = ex_dest;
+
+    exmem_d.memRead      = idex_q.memRead;
+    exmem_d.memWrite     = idex_q.memWrite;
+    exmem_d.memToReg     = idex_q.memToReg;
+    exmem_d.regWrite     = idex_q.regWrite;
+
+    exmem_d.valid        = idex_q.valid;
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) exmem_q <= '0;
+    else        exmem_q <= exmem_d;
+  end
+
+  // ===========================================================================
+  // MEM stage: simple D-port drive
+  // ===========================================================================
+  assign dmem_memRead  = exmem_q.valid && exmem_q.memRead;
+  assign dmem_memWrite = exmem_q.valid && exmem_q.memWrite;
+  assign dmem_addr     = exmem_q.alu_result;
+  assign dmem_wdata    = exmem_q.rt_forwarded;
+  assign dmem_be       = 4'b1111; // word ops; extend later for byte/half
+
+  // MEM/WB pipeline register ---------------------------------------------------
+  typedef struct packed {
+    logic [XLEN-1:0] alu_result;
+    logic [XLEN-1:0] load_data;
+    logic [REG_ADDR_W-1:0] rd;
+
+    // WB
+    logic memToReg, regWrite;
+
+    logic valid;
+  } memwb_t;
+
+  memwb_t memwb_q, memwb_d;
+
+  always_comb begin
+    memwb_d = memwb_q;
+
+    memwb_d.alu_result = exmem_q.alu_result;
+    memwb_d.load_data  = dmem_rdata;
+    memwb_d.rd         = exmem_q.rd;
+
+    memwb_d.memToReg   = exmem_q.memToReg;
+    memwb_d.regWrite   = exmem_q.regWrite;
+
+    memwb_d.valid      = exmem_q.valid;
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) memwb_q <= '0;
+    else        memwb_q <= memwb_d;
+  end
+
+  // ===========================================================================
+  // WB stage: writeback to register file
+  // ===========================================================================
+  logic [XLEN-1:0] wbData = (memwb_q.memToReg) ? memwb_q.load_data
+                                              : memwb_q.alu_result;
+
+  // drive regfile write port
+  assign u_rf.we    = memwb_q.valid && memwb_q.regWrite;
+  assign u_rf.waddr = memwb_q.rd;
+  assign u_rf.wdata = wbData;
+
+  // make forwarded value available
+  assign memwb_wbData   = wbData;
+  assign exmem_aluResult= exmem_q.alu_result;
+
+  // ===========================================================================
+  // Hazard detection + PC/IF/ID control
+  // ===========================================================================
+  logic ifIdW_int, controlMux_int;
+
+  // Your hazard.sv: fix trailing comma; rename `idExMW` logically to `idExMemRead`
+  hazard u_hzd (
+    .idExRt     (idex_q.rt),
+    .ifIdRs     (rs),
+    .ifIdRt     (rt),
+    .idExMW     (idex_q.memRead), // load in EX stage
+    .pcWrite    (pcWrite),
+    .ifIdW      (ifIdW_int),
+    .controlMux (controlMux_int)
+  );
+
+  assign controlMux = controlMux_int;
+
+  // On a taken branch (from EX), select next PC and squash IF/ID on next cycle
+  // (The classic textbook approach simply redirects PC; IF/ID will naturally update)
+  always_comb begin
+    pc_n  = pcsrctaken ? branch_target : pc_plus4;
+  end
+
+  // Freeze PC when hazard says so; allow redirect on branch
+  assign pc_en = pcWrite | pcsrctaken;
+
+  // IF/ID write enable: stall on hazard
+  assign ifIdW = ifIdW_int;
+
+endmodule
