@@ -6,14 +6,12 @@ module core #(
     input logic clk,
     output logic rst_n,
 
-    // ---------------- Instruction memory (simple Harvard I-port) ---------------
     output logic [XLEN-1:0]      imem_addr,   // PC
     input  logic [XLEN-1:0]      imem_rdata,  // fetched instruction
 
-    // ---------------- Data memory (simple Harvard D-port) ----------------------
     output logic                 dmem_memRead,
     output logic                 dmem_memWrite,
-    output logic [3:0]           dmem_be,     // byte-enables (word ops -> 4'b1111)
+    output logic [3:0]           dmem_be,     
     output logic [XLEN-1:0]      dmem_addr,
     output logic [XLEN-1:0]      dmem_wdata,
     input  logic [XLEN-1:0]      dmem_rdata
@@ -350,3 +348,4 @@ module core #(
 
 
 endmodule
+
